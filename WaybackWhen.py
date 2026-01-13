@@ -16,7 +16,8 @@ SETTINGS = {
 
 import requests
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse # Added urlunparse
+from collections import OrderedDict # Import OrderedDict for sorted query parameters
 import waybackpy
 from datetime import datetime, timedelta, timezone
 import time
@@ -37,6 +38,9 @@ from selenium.webdriver.common.by import By # Import By for CAPTCHA detection
 from selenium.common.exceptions import TimeoutException, WebDriverException # Import TimeoutException and WebDriverException
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+
+# Define a threading.local() object at the module level for WebDriver instances
+_thread_local = threading.local()
 
 # Function to set up and return a headless Chrome WebDriver
 def get_driver():
@@ -72,6 +76,40 @@ adapter = HTTPAdapter(max_retries=retry_strategy)
 # Removed: last_domain_access_time = {}
 # Lock to manage concurrent access to last_domain_access_time
 # Removed: domain_cooldown_lock = threading.Lock()
+
+# Define irrelevant extensions and path segments globally
+IRRELEVANT_EXTENSIONS = ('.pdf', '.zip', '.tar', '.gz', '.rar', '.7z', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.mp4', '.avi', '.mov', '.mp3', '.wav', '.flac', '.iso', '.exe', '.dmg', '.pkg', '.apk')
+IRRELEVANT_PATH_SEGMENTS = ('/cdn-cgi/', '/assets/', '/uploads/', '/wp-content/', '/wp-includes/', '/themes/', '/plugins/', '/node_modules/', '/static/', '/javascript/', '/css/', '/img/')
+
+def normalize_url(url):
+    """Normalizes a URL for consistent comparison and deduplication."""
+    parsed_url = urlparse(url)
+    
+    # Lowercase scheme and netloc for consistency
+    scheme = parsed_url.scheme.lower()
+    netloc = parsed_url.netloc.lower()
+    
+    # Remove fragments
+    path = parsed_url.path
+    
+    # Remove trailing slashes from path, but keep for root '/'
+    if path.endswith('/') and path != '/':
+        path = path.rstrip('/')
+        
+    # Sort query parameters for consistent URLs
+    query_params = parse_qs(parsed_url.query)
+    
+    # Remove common tracking parameters
+    tracking_params = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'gclid', 'fbclid', 'ref', 'src', 'cid', 'referrer']
+    for param in tracking_params:
+        query_params.pop(param, None)
+    
+    # Reconstruct query string with sorted parameters
+    sorted_query_params = OrderedDict(sorted(query_params.items()))
+    query = urlencode(sorted_query_params, doseq=True)
+    
+    return urlunparse((scheme, netloc, path, parsed_url.params, query, ''))
+
 
 def get_internal_links(base_url, driver): # Modified to accept a driver object
     """Scrapes a given URL to find all internal links and returns them as a set.
@@ -128,15 +166,28 @@ def get_internal_links(base_url, driver): # Modified to accept a driver object
             if href.startswith(('#', 'mailto:', 'javascript:')) or 'action=' in href:
                 continue
 
+            # --- NEW FILTERING STEPS ---
+            # Skip links if their href ends with any irrelevant extension
+            if any(href.lower().endswith(ext) for ext in IRRELEVANT_EXTENSIONS):
+                # print(f"[-] Skipping irrelevant extension: {href}")
+                continue
+
+            # Skip links if their href contains any irrelevant path segment
+            if any(segment in href.lower() for segment in IRRELEVANT_PATH_SEGMENTS):
+                # print(f"[-] Skipping irrelevant path segment: {href}")
+                continue
+            # --- END NEW FILTERING STEPS ---
+
             # Resolve relative URLs to absolute URLs
             full_url = urljoin(base_url, href)
-            parsed_url = urlparse(full_url)
+            parsed_full_url = urlparse(full_url)
 
             # Check if the parsed URL's domain matches the base URL's domain
             # This ensures only internal links are collected.
-            if parsed_url.netloc == domain:
+            if parsed_full_url.netloc == domain:
                 # Construct a clean URL without query parameters or fragments
-                clean_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+                # Now using the normalize_url helper function
+                clean_url = normalize_url(full_url)
                 links.add(clean_url)
 
     # Handle specific HTTP errors during the request (Selenium errors are different from requests)
@@ -273,16 +324,22 @@ def process_link_for_archiving(link, global_archive_action):
     else:
         return f"Skipped: {link}"
 
+# Wrapper function to manage thread-local driver instances
+def wrapper_get_internal_links(url_to_crawl):
+    # Check if a WebDriver instance already exists for the current thread
+    if not hasattr(_thread_local, 'driver'):
+        # If no driver exists, create a new one and store it in _thread_local
+        _thread_local.driver = get_driver()
+
+    # Use the thread-local driver for scraping
+    links = get_internal_links(url_to_crawl, _thread_local.driver)
+    return links
+
 def crawl_website(base_url):
     """
     Performs a breadth-first search (BFS) to discover all internal links within a given base URL.
     Uses parallel processing for efficient scraping.
-
-    Contributors: Optimizing the BFS algorithm (e.g., using a faster data structure for visited URLs),
-    or improving the parallel processing strategy could be future enhancements.
     """
-    # Removed driver initialization from here. Each worker will get its own driver.
-
     # Initialize a deque (double-ended queue) for BFS, starting with the base_url
     queue = deque([base_url])
     # Keep track of visited URLs to avoid redundant processing and infinite loops
@@ -290,24 +347,13 @@ def crawl_website(base_url):
     # Stores all unique internal links discovered during the crawl
     all_unique_internal_links = {base_url}
 
-    # Wrapper function to create and quit a driver for each task
-    def wrapper_get_internal_links(url_to_crawl):
-        driver = None
-        try:
-            driver = get_driver()
-            links = get_internal_links(url_to_crawl, driver)
-            return links
-        finally:
-            if driver:
-                driver.quit()
-
     try:
         # Determine max_workers based on SETTINGS
         max_workers = SETTINGS['max_crawler_workers']
         if max_workers == 0:
             max_workers = None # Set to None for unlimited workers (ThreadPoolExecutor default)
 
-        # Use ThreadPoolExecutor for concurrent processing of `get_internal_links` calls
+        # Use ThreadPoolExecutor for concurrent processing of `wrapper_get_internal_links` calls
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             while queue:
                 # Define a batch size for processing URLs in parallel
@@ -327,6 +373,10 @@ def crawl_website(base_url):
 
                 # Submit `wrapper_get_internal_links` for each URL in the batch to the executor.
                 for new_links_from_url in executor.map(wrapper_get_internal_links, current_batch_urls):
+                    # Ensure new_links_from_url is an iterable (e.g., set), even if an error occurred in wrapper_get_internal_links
+                    if new_links_from_url is None: # This should not happen if wrapper_get_internal_links always returns a set
+                        continue # Skip if wrapper_get_internal_links somehow returns None
+
                     for link in new_links_from_url:
                         all_unique_internal_links.add(link) # Add discovered link to the overall set
                         # Print discovered URL if it's new
@@ -336,8 +386,12 @@ def crawl_website(base_url):
                             queue.append(link)
     except Exception as e:
         print(f"An error occurred during website crawling: {e}")
+        return set() # Explicitly return an empty set on error
     finally:
-        # No driver.quit() here as drivers are managed per thread in wrapper_get_internal_links
+        # Note: WebDriver instances are no longer explicitly quit after each URL.
+        # They will persist for the lifetime of their respective worker threads within the ThreadPoolExecutor.
+        # Proper cleanup (driver.quit()) should ideally be handled when the ThreadPoolExecutor itself shuts down,
+        # which might require more advanced patterns for explicit resource management with concurrent.futures.
         pass
 
     return all_unique_internal_links
@@ -347,10 +401,6 @@ def main():
 
     Contributors: Consider adding command-line argument parsing for URLs, or integrating a configuration file.
     """
-    # Removed: Clear the last_domain_access_time dictionary at the start of each run
-    # global last_domain_access_time
-    # last_domain_access_time.clear()
-
     # Prompt the user to enter one or more URLs
     target_urls_input = input("Enter URLs (comma-separated, e.g., https://notawebsite.org/, https://example.com/): ").strip()
     # Split the input string by commas and clean up whitespace, filtering out empty strings
