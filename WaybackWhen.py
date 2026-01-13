@@ -320,8 +320,9 @@ def crawl_website(base_url):
                 for new_links_from_url in executor.map(wrapper_get_internal_links, current_batch_urls):
                     for link in new_links_from_url:
                         all_unique_internal_links.add(link) # Add discovered link to the overall set
-                        # If the link has not been visited yet, add it to the queue for future crawling
+                        # Print discovered URL if it's new
                         if link not in visited_urls:
+                            print(f"[DISCOVERED] {link}")
                             visited_urls.add(link)
                             queue.append(link)
     except Exception as e:
