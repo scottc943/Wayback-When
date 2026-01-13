@@ -13,7 +13,6 @@ SETTINGS = {
     'max_crawler_workers': 0, # Max concurrent workers for website crawling (0 for unlimited) - affects RAM usage massively
     'archiving_retries': 5 # Max retries for archiving a single link
 }
-
 import requests
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse # Added urlunparse
@@ -84,30 +83,30 @@ IRRELEVANT_PATH_SEGMENTS = ('/cdn-cgi/', '/assets/', '/uploads/', '/wp-content/'
 def normalize_url(url):
     """Normalizes a URL for consistent comparison and deduplication."""
     parsed_url = urlparse(url)
-    
+
     # Lowercase scheme and netloc for consistency
     scheme = parsed_url.scheme.lower()
     netloc = parsed_url.netloc.lower()
-    
+
     # Remove fragments
     path = parsed_url.path
-    
+
     # Remove trailing slashes from path, but keep for root '/'
     if path.endswith('/') and path != '/':
         path = path.rstrip('/')
-        
+
     # Sort query parameters for consistent URLs
     query_params = parse_qs(parsed_url.query)
-    
+
     # Remove common tracking parameters
     tracking_params = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'gclid', 'fbclid', 'ref', 'src', 'cid', 'referrer']
     for param in tracking_params:
         query_params.pop(param, None)
-    
+
     # Reconstruct query string with sorted parameters
     sorted_query_params = OrderedDict(sorted(query_params.items()))
     query = urlencode(sorted_query_params, doseq=True)
-    
+
     return urlunparse((scheme, netloc, path, parsed_url.params, query, ''))
 
 
@@ -123,81 +122,91 @@ def get_internal_links(base_url, driver): # Modified to accept a driver object
     parsed_base_url = urlparse(base_url)
     domain = parsed_base_url.netloc
 
-    try:
-        # Navigate to the base_url using Selenium
-        driver.get(base_url)
+    retries = SETTINGS.get('crawler_retries', 3) # Use a setting for crawler retries, default to 3
+    attempt = 0
+    while attempt < retries:
+        try:
+            # Navigate to the base_url using Selenium
+            driver.get(base_url)
 
-        # CAPTCHA Detection
-        captcha_indicators = [
-            (By.ID, 'g-recaptcha'),
-            (By.CLASS_NAME, 'g-recaptcha'),
-            (By.XPATH, "//iframe[contains(@src, 'google.com/recaptcha')]")
-        ]
-        captcha_detected = False
-        for by_type, value in captcha_indicators:
-            if driver.find_elements(by_type, value):
-                captcha_detected = True
-                break
+            # CAPTCHA Detection
+            captcha_indicators = [
+                (By.ID, 'g-recaptcha'),
+                (By.CLASS_NAME, 'g-recaptcha'),
+                (By.XPATH, "//iframe[contains(@src, 'google.com/recaptcha')]")
+            ]
+            captcha_detected = False
+            for by_type, value in captcha_indicators:
+                if driver.find_elements(by_type, value):
+                    captcha_detected = True
+                    break
 
-        if captcha_detected:
-            while True:
-                print(f"[CAPTCHA DETECTED] for {base_url}.\nPlease solve the CAPTCHA manually in the browser if it becomes visible.\nType 'continue' to resume crawling or 'skip' to skip this URL:")
-                user_choice = input().strip().lower()
-                if user_choice == 'continue':
-                    print("Attempting to continue after manual intervention...")
-                    break # Break the loop to re-attempt processing the page
-                elif user_choice == 'skip':
-                    print(f"Skipping {base_url} due to CAPTCHA.")
-                    return links # Return empty set if CAPTCHA detected and skipped
-                else:
-                    print("Invalid input. Please type 'continue' or 'skip'.")
+            if captcha_detected:
+                while True:
+                    print(f"[CAPTCHA DETECTED] for {base_url}.\nPlease solve the CAPTCHA manually in the browser if it becomes visible.\nType 'continue' to resume crawling or 'skip' to skip this URL:")
+                    user_choice = input().strip().lower()
+                    if user_choice == 'continue':
+                        print("Attempting to continue after manual intervention...")
+                        break # Break the loop to re-attempt processing the page
+                    elif user_choice == 'skip':
+                        print(f"Skipping {base_url} due to CAPTCHA.")
+                        return links # Return empty set if CAPTCHA detected and skipped
+                    else:
+                        print("Invalid input. Please type 'continue' or 'skip'.")
 
-        # Parse the HTML content of the page using BeautifulSoup from driver.page_source
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
-        # Extract the domain name from the base_url to identify internal links
-        domain = parsed_base_url.netloc
+            # Parse the HTML content of the page using BeautifulSoup from driver.page_source
+            soup = BeautifulSoup(driver.page_source, 'html.parser')
+            # Extract the domain name from the base_url to identify internal links
+            domain = parsed_base_url.netloc
 
-        # Find all anchor tags (<a>) that have an 'href' attribute
-        for anchor in soup.find_all('a', href=True):
-            href = anchor['href']
+            # Find all anchor tags (<a>) that have an 'href' attribute
+            for anchor in soup.find_all('a', href=True):
+                href = anchor['href']
 
-            # Skip links that are fragments, mailto links, javascript, or contain 'action='
-            # These are typically not relevant for archiving content.
-            if href.startswith(('#', 'mailto:', 'javascript:')) or 'action=' in href:
-                continue
+                # Skip links that are fragments, mailto links, javascript, or contain 'action='
+                # These are typically not relevant for archiving content.
+                if href.startswith(('#', 'mailto:', 'javascript:')) or 'action=' in href:
+                    continue
 
-            # --- NEW FILTERING STEPS ---
-            # Skip links if their href ends with any irrelevant extension
-            if any(href.lower().endswith(ext) for ext in IRRELEVANT_EXTENSIONS):
-                # print(f"[-] Skipping irrelevant extension: {href}")
-                continue
+                # --- NEW FILTERING STEPS ---
+                # Skip links if their href ends with any irrelevant extension
+                if any(href.lower().endswith(ext) for ext in IRRELEVANT_EXTENSIONS):
+                    # print(f"[-] Skipping irrelevant extension: {href}")
+                    continue
 
-            # Skip links if their href contains any irrelevant path segment
-            if any(segment in href.lower() for segment in IRRELEVANT_PATH_SEGMENTS):
-                # print(f"[-] Skipping irrelevant path segment: {href}")
-                continue
-            # --- END NEW FILTERING STEPS ---
+                # Skip links if their href contains any irrelevant path segment
+                if any(segment in href.lower() for segment in IRRELEVANT_PATH_SEGMENTS):
+                    # print(f"[-] Skipping irrelevant path segment: {href}")
+                    continue
+                # --- END NEW FILTERING STEPS ---
 
-            # Resolve relative URLs to absolute URLs
-            full_url = urljoin(base_url, href)
-            parsed_full_url = urlparse(full_url)
+                # Resolve relative URLs to absolute URLs
+                full_url = urljoin(base_url, href)
+                parsed_full_url = urlparse(full_url)
 
-            # Check if the parsed URL's domain matches the base URL's domain
-            # This ensures only internal links are collected.
-            if parsed_full_url.netloc == domain:
-                # Construct a clean URL without query parameters or fragments
-                # Now using the normalize_url helper function
-                clean_url = normalize_url(full_url)
-                links.add(clean_url)
+                # Check if the parsed URL's domain matches the base URL's domain
+                # This ensures only internal links are collected.
+                if parsed_full_url.netloc == domain:
+                    # Construct a clean URL without query parameters or fragments
+                    # Now using the normalize_url helper function
+                    clean_url = normalize_url(full_url)
+                    links.add(clean_url)
+            return links # If successful, break retry loop and return links
 
-    # Handle specific HTTP errors during the request (Selenium errors are different from requests)
-    except TimeoutException:
-        print(f"[!] Page load timed out for {base_url}. Skipping.")
-    except WebDriverException as e:
-        print(f"[!] A WebDriver error occurred while crawling {base_url}: {e}")
-    except Exception as e:
-        print(f"[!] An unexpected error occurred while crawling {base_url} with Selenium: {e}")
-
+        # Handle specific HTTP errors during the request (Selenium errors are different from requests)
+        except TimeoutException:
+            print(f"[!] Page load timed out for {base_url}. Retrying ({retries - attempt - 1} attempts left).")
+            attempt += 1
+            time.sleep(2) # Short delay before retrying
+        except WebDriverException as e:
+            print(f"[!] A WebDriver error occurred while crawling {base_url}: {e}. Retrying ({retries - attempt - 1} attempts left).")
+            attempt += 1
+            time.sleep(2) # Short delay before retrying
+        except Exception as e:
+            print(f"[!] An unexpected error occurred while crawling {base_url} with Selenium: {e}. Retrying ({retries - attempt - 1} attempts left).")
+            attempt += 1
+            time.sleep(2) # Short delay before retrying
+    print(f"[!] Failed to retrieve {base_url} after {retries} attempts.")
     return links
 
 def should_archive(url, global_archive_action):
@@ -216,7 +225,10 @@ def should_archive(url, global_archive_action):
         return False, wayback
 
     # If global_archive_action is 'n' (Normal), proceed with the 48-hour check logic.
-    while True:
+    # Implement retry logic for should_archive as well
+    retries = SETTINGS.get('archiving_retries', 3) # Use the archiving retries setting
+    attempt = 0
+    while attempt < retries:
         try:
             # Get the most recent archive record for the URL from Wayback Machine
             newest = wayback.newest()
@@ -244,17 +256,14 @@ def should_archive(url, global_archive_action):
             return True, wayback
         # Handle other unexpected errors during the archive check
         except Exception as e:
-            print(f"[!] An error occurred while checking archive for {url}: {e}")
-            # Prompt the user to retry or skip the URL in case of an error
-            user_choice = input("Type 'retry' to try again or 'skip' to skip this URL: ").strip().lower()
-            if user_choice == 'retry':
-                print("Retrying in 5 seconds...")
+            attempt += 1
+            if attempt < retries:
+                print(f"[!] An error occurred while checking archive for {url}: {e}. Retrying ({retries - attempt} attempts left).")
                 time.sleep(5) # Wait before retrying the archive check
-            elif user_choice == 'skip':
-                print(f"Skipping {url} due to user request.")
-                return False, wayback # Skip this URL if user chooses to
             else:
-                print("Invalid input. Please type 'retry' or 'skip'.")
+                print(f"[!] Failed to check archive for {url} after {retries} attempts: {e}. Skipping.")
+                return False, wayback # Skip this URL if all retries fail
+    return False, wayback # Should not be reached if retries are handled correctly or success occurs
 
 # A lock to ensure only one thread modifies `last_archive_time` at a time
 archive_lock = threading.Lock()
@@ -298,28 +307,17 @@ def process_link_for_archiving(link, global_archive_action):
                 # Check for a specific rate limit error message from Wayback Machine
                 rate_limit_keyword = 'Save request refused by the server. Save Page Now limits saving 15 URLs per minutes.'
 
+                retries -= 1
                 if rate_limit_keyword in error_message:
-                    # If rate limit hit, prompt user for action (retry or skip)
-                    while True:
-                        user_choice = input(f"Wayback Machine rate limit hit for {link}. Type 'R' to retry after 5 minutes or 'S' to skip this URL: ").strip().lower()
-                        if user_choice == 'r':
-                            print("Pausing for 5 minutes as requested...")
-                            time.sleep(300) # Pause for 5 minutes (300 seconds)
-                            break # Break from this inner loop to re-attempt archiving
-                        elif user_choice == 's':
-                            print(f"Skipping {link} as requested.")
-                            return f"User skipped archiving due to rate limit: {link}"
-                        else:
-                            print("Invalid input. Please type 'R' or 'S'.")
+                    # If rate limit hit, automatically pause for 5 minutes and retry
+                    print(f"[!] Wayback Machine rate limit hit for {link}. Pausing for 5 minutes before retrying ({retries} attempts left)....")
+                    time.sleep(300) # Pause for 5 minutes (300 seconds)
+                elif retries > 0:
+                    print(f"[!] Could not save {link}: {e}. Retrying ({retries} attempts left)...")
+                    time.sleep(2) # Short cooldown before next retry for other errors
                 else:
-                    # For other errors, decrement retry count and retry if attempts remain
-                    retries -= 1
-                    if retries > 0:
-                        print(f"[!] Could not save {link}: {e}. Retrying ({retries} attempts left)...")
-                        time.sleep(2) # Short cooldown before next retry for other errors
-                    else:
-                        # If no retries left, report failure
-                        return f"[!] Failed to archive {link} after multiple attempts: {e}"
+                    # If no retries left, report failure
+                    return f"[!] Failed to archive {link} after multiple attempts: {e}"
         return f"[!] Failed to archive {link} after multiple attempts." # Return after retry loop finishes
     else:
         return f"Skipped: {link}"
@@ -397,7 +395,8 @@ def crawl_website(base_url):
     return all_unique_internal_links
 
 def main():
-    """Main function to orchestrate the website crawling and archiving process.
+    """
+    Main function to orchestrate the website crawling and archiving process.
 
     Contributors: Consider adding command-line argument parsing for URLs, or integrating a configuration file.
     """
