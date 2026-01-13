@@ -10,8 +10,12 @@ import concurrent.futures
 from collections import deque
 import threading
 
-#Settings
-archiving_cooldown=2 #2 days default
+# Define Settings Dictionary
+SETTINGS = {
+    'archiving_cooldown': 2, # Default cooldown in days
+    'urls_per_minute_limit': 15, # Max URLs to archive per minute
+    'max_crawler_workers': 15 # Max concurrent workers for website crawling
+}
 
 def get_internal_links(base_url):
     """Scrapes a given URL to find all internal links and returns them as a set.
@@ -119,13 +123,13 @@ def should_archive(url, global_archive_action):
             # Calculate the time difference since the last archive
             time_diff = current_utc_dt - last_archived_dt
 
-            # If the last archive was less than 48 hours ago, skip archiving
-            if time_diff < timedelta(hours=archiving_cooldown*24):
+            # If the last archive was less than `archiving_cooldown` days ago, skip archiving
+            if time_diff < timedelta(days=SETTINGS['archiving_cooldown']):
                 print(f"[-] Skipping: {url} (Last archived {time_diff.total_seconds() // 3600:.1f} hours ago)")
                 return False, wayback
             # Otherwise, the URL needs archiving
             else:
-                print(f"[+] Needs Archive: {url} (Last archived {time_diff.total_seconds() // 3600:.1f} hours ago, > 48 hours)")
+                print(f"[+] Needs Archive: {url} (Last archived {time_diff.total_seconds() // 3600:.1f} hours ago, > {SETTINGS['archiving_cooldown']*24} hours)")
                 return True, wayback
 
         # Handle cases where no existing archive record is found for the URL
@@ -150,10 +154,8 @@ def should_archive(url, global_archive_action):
 archive_lock = threading.Lock()
 # Timestamp of the last archive request, initialized to 0.0
 last_archive_time = 0.0
-# Rate limit for Wayback Machine API requests (15 URLs per minute)
-URLS_PER_MINUTE_LIMIT = 15
 # Minimum delay required between archive requests to respect rate limits
-MIN_ARCHIVE_DELAY_SECONDS = 60 / URLS_PER_MINUTE_LIMIT
+MIN_ARCHIVE_DELAY_SECONDS = 60 / SETTINGS['urls_per_minute_limit']
 
 def process_link_for_archiving(link, global_archive_action):
     """Checks if a link needs archiving and attempts to save it to Wayback Machine with rate limiting and retries.
@@ -231,11 +233,11 @@ def crawl_website(base_url):
     all_unique_internal_links = {base_url}
 
     # Use ThreadPoolExecutor for parallel processing of `get_internal_links` calls
-    # max_workers=15 allows for up to 15 concurrent scraping operations.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+    # `max_crawler_workers` allows for up to that many concurrent scraping operations.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=SETTINGS['max_crawler_workers']) as executor:
         while queue:
             # Define a batch size for processing URLs in parallel
-            batch_size = 15
+            batch_size = SETTINGS['max_crawler_workers'] # Use max_crawler_workers as batch size
             current_batch_urls = []
 
             # Populate the batch with URLs from the queue, up to `batch_size`
@@ -280,7 +282,7 @@ def main():
     all_discovered_links = set() # Set to store all unique internal links found across all initial URLs
     for url in initial_urls:
         # Basic validation to ensure the URL starts with 'http' or 'https'
-        if not url.startswith("http"): 
+        if not url.startswith("http"):
             print(f"Invalid URL format for {url}. Skipping.")
             continue
         print(f"\nStarting crawl for initial URL: {url}")
@@ -293,7 +295,7 @@ def main():
 
     # Loop until a valid global archiving action is chosen by the user
     while True:
-        global_choice = input(f"Choose global archiving action: 'A' (Archive All), 'N' (Archive Normally - respecting {archiving_cooldown*24}h rule), 'S' (Skip All): ").strip().lower()
+        global_choice = input(f"Choose global archiving action: 'A' (Archive All), 'N' (Archive Normally - respecting {SETTINGS['archiving_cooldown']*24}h rule), 'S' (Skip All): ").strip().lower()
         if global_choice in ['a', 'n', 's']:
             break # Exit loop if input is valid
         else:
