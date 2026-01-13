@@ -1,3 +1,18 @@
+# Install required Python packages
+!pip install requests beautifulsoup4 waybackpy selenium webdriver-manager
+
+# Install google-chrome-stable for better compatibility with ChromeDriver
+!wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add -
+!echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | tee /etc/apt/sources.list.d/google-chrome.list
+!apt-get update && apt-get install -y google-chrome-stable
+
+# Define Settings Dictionary
+SETTINGS = {
+    'archiving_cooldown': 2, # Default cooldown in days
+    'urls_per_minute_limit': 15, # Max URLs to archive per minute
+    'max_crawler_workers': 15 # Max concurrent workers for website crawling
+}
+
 import requests
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from urllib.parse import urljoin, urlparse
@@ -18,16 +33,9 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service as ChromeService # Import ChromeService
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.common.by import By # Import By for CAPTCHA detection
+from selenium.common.exceptions import TimeoutException, WebDriverException # Import TimeoutException and WebDriverException
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
-
-# Install required Python packages
-!pip install requests beautifulsoup4 waybackpy selenium webdriver-manager
-
-# Install google-chrome-stable for better compatibility with ChromeDriver
-!wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add -
-!echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | tee /etc/apt/sources.list.d/google-chrome.list
-!apt-get update && apt-get install -y google-chrome-stable
 
 # Function to set up and return a headless Chrome WebDriver
 def get_driver():
@@ -44,15 +52,11 @@ def get_driver():
     # Initialize ChromeDriver using webdriver_manager to handle downloads and setup
     service = ChromeService(executable_path=ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
+    driver.set_page_load_timeout(240) # Set page load timeout to 240 seconds (4 minutes)
+    driver.command_executor.set_timeout(300) # Set command executor timeout to 300 seconds (5 minutes)
     return driver
 
 
-# Define Settings Dictionary
-SETTINGS = {
-    'archiving_cooldown': 2, # Default cooldown in days
-    'urls_per_minute_limit': 15, # Max URLs to archive per minute
-    'max_crawler_workers': 30 # Max concurrent workers for website crawling
-}
 
 # Configure a retry strategy once, to be used for each new session
 retry_strategy = Retry(
@@ -79,12 +83,6 @@ def get_internal_links(base_url, driver): # Modified to accept a driver object
     # Extract the domain from the base_url
     parsed_base_url = urlparse(base_url)
     domain = parsed_base_url.netloc
-
-    # Removed: Domain-specific cooldown logic
-
-    # The headers dictionary is largely for requests.Session, not directly for Selenium's driver.get()
-    # User-Agent is set in get_driver options.
-    # Other headers are handled by the browser context Selenium provides.
 
     try:
         # Navigate to the base_url using Selenium
@@ -141,8 +139,12 @@ def get_internal_links(base_url, driver): # Modified to accept a driver object
                 links.add(clean_url)
 
     # Handle specific HTTP errors during the request (Selenium errors are different from requests)
+    except TimeoutException:
+        print(f"[!] Page load timed out for {base_url}. Skipping.")
+    except WebDriverException as e:
+        print(f"[!] A WebDriver error occurred while crawling {base_url}: {e}")
     except Exception as e:
-        print(f"An error occurred while crawling {base_url} with Selenium: {e}")
+        print(f"[!] An unexpected error occurred while crawling {base_url} with Selenium: {e}")
 
     return links
 
