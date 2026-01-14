@@ -47,10 +47,10 @@ SETTINGS = {
     'urls_per_minute_limit': 15, # Max URLs to archive per minute
     'max_crawler_workers': 0, # Max concurrent workers for website crawling (0 for unlimited) - affects RAM usage massively
     'retries': 5, # Max retries for archiving a single link
-    'default_archiving_action': 's', # Default archiving action: 'n' (Normal), 'a' (Archive All), 's' (Skip All)
+    'default_archiving_action': 'N', # Default archiving action: 'n' (Normal), 'a' (Archive All), 's' (Skip All)
     'debug_mode': False, # Set to True to enable debug messages, False to disable
     'max_archiver_workers': 0,
-    'enable_visual_tree_generation': True #setting for visual tree generation-incredibly ram intensive
+    'enable_visual_tree_generation': False #setting for visual tree generation-incredibly ram intensive
 }
 
 # Define a threading.local() object at the module level for WebDriver instances
@@ -224,6 +224,7 @@ def get_internal_links(base_url, driver): # Modified to accept a driver object
     parsed_base_url = urlparse(base_url)
     base_netloc = parsed_base_url.netloc
     base_root_domain = get_root_domain(base_netloc)
+    normalized_base_url_for_comparison = normalize_url(base_url) # Normalize base_url for comparison
 
     log_message('DEBUG', f"Starting get_internal_links for base_url: {base_url} with base_netloc: {base_netloc} and root_domain: {base_root_domain}", debug_only=True)
 
@@ -278,12 +279,14 @@ def get_internal_links(base_url, driver): # Modified to accept a driver object
                     link_netloc = parsed_full_url.netloc
                     link_root_domain = get_root_domain(link_netloc)
 
-                    if link_root_domain == base_root_domain:
-                        clean_url = normalize_url(full_url)
-                        log_message('DEBUG', f"Adding internal link: {clean_url} (Root domain: {link_root_domain})", debug_only=True)
+                    clean_url = normalize_url(full_url)
+
+                    # New check: Ensure the discovered link is the same as or a sub-path of the base_url
+                    if link_root_domain == base_root_domain and clean_url.startswith(normalized_base_url_for_comparison):
+                        log_message('DEBUG', f"Adding internal link: {clean_url} (Root domain: {link_root_domain}, is sub-path of base_url)", debug_only=True)
                         links.add(clean_url)
                     else:
-                        log_message('DEBUG', f"Skipping external link: {full_url} (Link root domain: {link_root_domain} != Base root domain: {base_root_domain})", debug_only=True)
+                        log_message('DEBUG', f"Skipping external or parent link: {full_url} (Link root domain: {link_root_domain} != Base root domain: {base_root_domain} OR not sub-path of base_url)", debug_only=True)
             if not found_any_href:
                 log_message('DEBUG', f"No href attributes found on {base_url} by Selenium.", debug_only=True)
 
@@ -574,7 +577,7 @@ def main():
         for future in concurrent.futures.as_completed(crawling_futures):
             try:
                 discovered_links_for_url, _ = future.result() # Unpack both returned values, but only use the first
-                all_discovered_links.update(discovered_links_for_url)
+                all_discovered_links.update(discovered_links_for_for_url)
             except Exception as e:
                 log_message('ERROR', f"Error during crawling task: {e}")
 
@@ -647,10 +650,36 @@ def main():
         node_labels = {}
         for node in G.nodes():
             parsed_node = urlparse(node)
-            if parsed_node.path == '/' or not parsed_node.path:
-                node_labels[node] = parsed_node.netloc  # Use domain for root URLs
+            label_candidate = parsed_node.netloc
+            if parsed_node.path and parsed_node.path != '/':
+                # If the path is long, prioritize keeping some part of it visible.
+                # Combine domain and path for a more descriptive label.
+                label_candidate += parsed_node.path
+
+            # Define a maximum length for the label to prevent excessive width
+            max_label_length = 25 # This can be tuned for desired verbosity
+
+            if len(label_candidate) > max_label_length:
+                # If the full combined label is too long, truncate it smartly.
+                # Try to keep the domain and a truncated part of the path.
+                domain_part = parsed_node.netloc
+                path_part = parsed_node.path if parsed_node.path and parsed_node.path != '/' else ''
+
+                if len(domain_part) + len(path_part) > max_label_length:
+                    # Calculate how much of the path can fit after the domain (minus '...')
+                    allowed_path_len = max_label_length - len(domain_part) - 3 # -3 for "..."
+                    if allowed_path_len > 0 and path_part:
+                        label = domain_part + path_part[:allowed_path_len] + "..."
+                    elif len(domain_part) > max_label_length - 3: # If domain itself is too long
+                        label = domain_part[:max_label_length - 3] + "..."
+                    else: # Fallback if domain is too long and no path, or path is too short
+                        label = domain_part # Just show domain if nothing else fits well
+                else:
+                    label = label_candidate # Should not be reached if initial check was correct
             else:
-                node_labels[node] = parsed_node.path # Use path for other URLs
+                label = label_candidate # Label fits within max_label_length
+
+            node_labels[node] = label
 
         # Adjust font size based on the number of nodes to avoid overlap
         # Adjusted font_size calculation for better scaling and smaller text
