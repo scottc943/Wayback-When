@@ -6,13 +6,6 @@
 !echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | tee /etc/apt/sources.list.d/google-chrome.list
 !apt-get update && apt-get install -y google-chrome-stable
 
-# Define Settings Dictionary
-SETTINGS = {
-    'archiving_cooldown': 2, # Default cooldown in days
-    'urls_per_minute_limit': 15, # Max URLs to archive per minute
-    'max_crawler_workers': 0, # Max concurrent workers for website crawling (0 for unlimited) - affects RAM usage massively
-    'archiving_retries': 5 # Max retries for archiving a single link
-}
 import requests
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse # Added urlunparse
@@ -38,9 +31,17 @@ from selenium.common.exceptions import TimeoutException, WebDriverException # Im
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
+# Define Settings Dictionary
+SETTINGS = {
+    'archiving_cooldown': 2, # Default cooldown in days
+    'urls_per_minute_limit': 15, # Max URLs to archive per minute
+    'max_crawler_workers': 0, # Max concurrent workers for website crawling (0 for unlimited) - affects RAM usage massively
+    'archiving_retries': 5 # Max retries for archiving a single link
+}
+
 # Define a threading.local() object at the module level for WebDriver instances
 _thread_local = threading.local()
-
+clear_output(wait=True)
 # Function to set up and return a headless Chrome WebDriver
 def get_driver():
     options = Options()
@@ -120,7 +121,7 @@ def get_internal_links(base_url, driver): # Modified to accept a driver object
 
     # Extract the domain from the base_url
     parsed_base_url = urlparse(base_url)
-    domain = parsed_base_url.netloc
+    # Removed: domain = parsed_base_url.netloc
 
     retries = SETTINGS.get('crawler_retries', 3) # Use a setting for crawler retries, default to 3
     attempt = 0
@@ -163,34 +164,32 @@ def get_internal_links(base_url, driver): # Modified to accept a driver object
             for anchor in soup.find_all('a', href=True):
                 href = anchor['href']
 
-                # Skip links that are fragments, mailto links, javascript, or contain 'action='
+                # REMOVED: Skip links that are fragments, mailto links, javascript, or contain 'action='
                 # These are typically not relevant for archiving content.
-                if href.startswith(('#', 'mailto:', 'javascript:')) or 'action=' in href:
-                    continue
+                # if href.startswith(('#', 'mailto:', 'javascript:')) or 'action=' in href:
+                #    continue
 
                 # --- NEW FILTERING STEPS ---
-                # Skip links if their href ends with any irrelevant extension
-                if any(href.lower().endswith(ext) for ext in IRRELEVANT_EXTENSIONS):
-                    # print(f"[-] Skipping irrelevant extension: {href}")
-                    continue
+                # REMOVED: Skip links if their href ends with any irrelevant extension
+                # if any(href.lower().endswith(ext) for ext in IRRELEVANT_EXTENSIONS):
+                #     continue
 
-                # Skip links if their href contains any irrelevant path segment
-                if any(segment in href.lower() for segment in IRRELEVANT_PATH_SEGMENTS):
-                    # print(f"[-] Skipping irrelevant path segment: {href}")
-                    continue
+                # REMOVED: Skip links if their href contains any irrelevant path segment
+                # if any(segment in href.lower() for segment in IRRELEVANT_PATH_SEGMENTS):
+                #     continue
                 # --- END NEW FILTERING STEPS ---
 
                 # Resolve relative URLs to absolute URLs
                 full_url = urljoin(base_url, href)
-                parsed_full_url = urlparse(full_url)
+                # Removed: parsed_full_url = urlparse(full_url)
 
                 # Check if the parsed URL's domain matches the base URL's domain
                 # This ensures only internal links are collected.
-                if parsed_full_url.netloc == domain:
-                    # Construct a clean URL without query parameters or fragments
-                    # Now using the normalize_url helper function
-                    clean_url = normalize_url(full_url)
-                    links.add(clean_url)
+                # Removed: if parsed_full_url.netloc == domain:
+                # Construct a clean URL without query parameters or fragments
+                # Now using the normalize_url helper function
+                clean_url = normalize_url(full_url)
+                links.add(clean_url)
             return links # If successful, break retry loop and return links
 
         # Handle specific HTTP errors during the request (Selenium errors are different from requests)
@@ -400,6 +399,8 @@ def main():
 
     Contributors: Consider adding command-line argument parsing for URLs, or integrating a configuration file.
     """
+    clear_output(wait=True) # Clear output at the very beginning for a cleaner console
+
     # Prompt the user to enter one or more URLs
     target_urls_input = input("Enter URLs (comma-separated, e.g., https://notawebsite.org/, https://example.com/): ").strip()
     # Split the input string by commas and clean up whitespace, filtering out empty strings
@@ -440,6 +441,9 @@ def main():
         print(f"Global choice: Archiving all {len(all_discovered_links)} discovered links.")
     elif global_choice == 's':
         print(f"Global choice: Skipping all {len(all_discovered_links)} discovered links.")
+
+    # Clear output again before the final summary for cleanliness
+    clear_output(wait=True)
 
     results = [] # List to store the results of archiving attempts
     # Iterate through all discovered unique links (sorted for consistent output)
