@@ -1,5 +1,5 @@
 # Install required Python packages
-!pip install requests beautifulsoup4 waybackpy selenium webdriver-manager selenium-stealth
+!pip install --upgrade requests beautifulsoup4 waybackpy selenium webdriver-manager selenium-stealth
 
 # Install google-chrome-stable for better compatibility with ChromeDriver
 !wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add -
@@ -31,6 +31,9 @@ from selenium.webdriver.common.by import By # Import By for CAPTCHA detection
 from selenium.common.exceptions import TimeoutException, WebDriverException # Import TimeoutException and WebDriverException
 from selenium_stealth import stealth
 
+import networkx as nx # Import networkx
+import matplotlib.pyplot as plt # Import matplotlib for plotting
+
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 # Custom exception for CAPTCHA detection
@@ -43,10 +46,11 @@ SETTINGS = {
     'archiving_cooldown': 7, # Default cooldown in days
     'urls_per_minute_limit': 15, # Max URLs to archive per minute
     'max_crawler_workers': 0, # Max concurrent workers for website crawling (0 for unlimited) - affects RAM usage massively
-    'retries': 5, # Max retries for archivingsca single link
-    'default_archiving_action': 'n', # Default archiving action: 'n' (Normal), 'a' (Archive All), 's' (Skip All)
+    'retries': 5, # Max retries for archiving a single link
+    'default_archiving_action': 's', # Default archiving action: 'n' (Normal), 'a' (Archive All), 's' (Skip All)
     'debug_mode': False, # Set to True to enable debug messages, False to disable
-    'max_archiver_workers': 0
+    'max_archiver_workers': 0,
+    'enable_visual_tree_generation': True #setting for visual tree generation-incredibly ram intensive
 }
 
 # Define a threading.local() object at the module level for WebDriver instances
@@ -105,8 +109,8 @@ def generate_random_user_agent():
 
 # Possible platforms, webgl_vendors, and renderers for randomization
 STEALTH_PLATFORMS = [
-    "Win32", 
-    "Linux x86_64", 
+    "Win32",
+    "Linux x86_64",
     "MacIntel"
 ]
 STEALTH_WEBGL_VENDORS = [
@@ -116,7 +120,7 @@ STEALTH_RENDERERS = [
     "ANGLE (Intel, Intel(R) Iris(TM) Graphics 6100 (OpenGL 4.5), OpenGL 4.5.0)",
     "Intel Iris OpenGL Engine",
     "Google SwiftShader",
-    "Metal" # For MacIntel
+    "Metal"
 ]
 
 # Function to set up and return a headless Chrome WebDriver
@@ -146,7 +150,6 @@ def get_driver():
     driver.set_page_load_timeout(240) # Set page load timeout to 240 seconds (4 minutes)
     driver.command_executor.set_timeout(300) # Set command executor timeout to 300 seconds (5 minutes)
     return driver
-
 
 
 # Configure a retry strategy once, to be used for each new session
@@ -198,6 +201,16 @@ def normalize_url(url):
 
     return urlunparse((scheme, netloc, path, parsed_url.params, query, ''))
 
+def get_root_domain(netloc):
+    """Extracts the root domain from a netloc (e.g., 'example.com' from 'www.example.com' or 'sub.example.com')."""
+    # Lowercase for consistent comparison
+    netloc = netloc.lower()
+    parts = netloc.split('.')
+    if len(parts) > 2 and parts[0] == 'www':
+        return ".".join(parts[1:])
+    elif len(parts) > 2: # For sub.example.com, take the last two parts assuming a TLD like .com, .org
+        return ".".join(parts[-2:])
+    return netloc # For example.com
 
 def get_internal_links(base_url, driver): # Modified to accept a driver object
     """Scrapes a given URL to find all internal links and returns them as a set.
@@ -207,11 +220,12 @@ def get_internal_links(base_url, driver): # Modified to accept a driver object
     """
     links = set()
 
-    # Extract the domain from the base_url
+    # Extract the domain from the base_url and its root domain
     parsed_base_url = urlparse(base_url)
-    domain = parsed_base_url.netloc
+    base_netloc = parsed_base_url.netloc
+    base_root_domain = get_root_domain(base_netloc)
 
-    log_message('DEBUG', f"Starting get_internal_links for base_url: {base_url} with domain: {domain}", debug_only=True)
+    log_message('DEBUG', f"Starting get_internal_links for base_url: {base_url} with base_netloc: {base_netloc} and root_domain: {base_root_domain}", debug_only=True)
 
     retries = SETTINGS['retries'] # Use the 'retries' setting
     attempt = 0
@@ -225,7 +239,7 @@ def get_internal_links(base_url, driver): # Modified to accept a driver object
             # Navigate to the base_url using Selenium
             driver.get(base_url)
 
-            # --- NEW: Add a small delay to ensure page elements are loaded ---
+            # Add a small delay to ensure page elements are loaded ---
             # Randomize sleep duration between 2 and 5 seconds
             time.sleep(random.uniform(2, 5))
 
@@ -260,13 +274,16 @@ def get_internal_links(base_url, driver): # Modified to accept a driver object
                     full_url = urljoin(base_url, href)
                     parsed_full_url = urlparse(full_url)
 
-                    # Check if the parsed URL's domain matches the base URL's domain
-                    if parsed_full_url.netloc == domain:
+                    # Check if the parsed URL's root domain matches the base URL's root domain
+                    link_netloc = parsed_full_url.netloc
+                    link_root_domain = get_root_domain(link_netloc)
+
+                    if link_root_domain == base_root_domain:
                         clean_url = normalize_url(full_url)
-                        log_message('DEBUG', f"Adding internal link: {clean_url}", debug_only=True)
+                        log_message('DEBUG', f"Adding internal link: {clean_url} (Root domain: {link_root_domain})", debug_only=True)
                         links.add(clean_url)
                     else:
-                        log_message('DEBUG', f"Skipping external link: {full_url} (Domain: {parsed_full_url.netloc} != {domain})", debug_only=True)
+                        log_message('DEBUG', f"Skipping external link: {full_url} (Link root domain: {link_root_domain} != Base root domain: {base_root_domain})", debug_only=True)
             if not found_any_href:
                 log_message('DEBUG', f"No href attributes found on {base_url} by Selenium.", debug_only=True)
 
@@ -343,7 +360,7 @@ def should_archive(url, global_archive_action):
             else:
                 log_message('ERROR', f"Failed to check archive for {url} after {retries} attempts: {e}. Defaulting to archive.")
                 return True, wayback # Default to archive if all retries fail
-    return False, wayback # Should not be reached if retries are handled correctly or success occurs
+    return False, wb_obj # Should not be reached if retries are handled correctly or success occurs
 
 # A lock to ensure only one thread modifies `last_archive_time` at a time
 archive_lock = threading.Lock()
@@ -389,8 +406,8 @@ def process_link_for_archiving(link, global_archive_action):
 
                 retries -= 1
                 if rate_limit_keyword in error_message:
-                    log_message('WARNING', f"Wayback Machine rate limit hit for {link}. Pausing for 5 minutes before retrying ({retries} attempts left).")
-                    time.sleep(300) # Pause for 5 minutes (300 seconds)
+                    log_message('WARNING', f"Wayback Machine rate limit hit for {link}. Pausing for 1 minute before retrying ({retries} attempts left).")
+                    time.sleep(60) # Pause for 1 minutes (60 seconds)
                 elif retries > 0:
                     log_message('WARNING', f"Could not save {link}: {e}. Retrying ({retries} attempts left)...")
                     time.sleep(2) # Short cooldown before next retry for other errors
@@ -412,7 +429,7 @@ def wrapper_get_internal_links(url_to_crawl):
     links = get_internal_links(url_to_crawl, _thread_local.driver)
     return links
 
-def crawl_website(base_url, archiver_executor, archiving_futures, global_archive_action):
+def crawl_website(base_url, archiver_executor, archiving_futures, global_archive_action, link_relationships): # Added link_relationships
     """
     Performs a breadth-first search (BFS) to discover all internal links within a given base URL.
     Uses parallel processing for efficient scraping.
@@ -469,6 +486,11 @@ def crawl_website(base_url, archiver_executor, archiving_futures, global_archive
                                 log_message('DISCOVERED', link) # This line will now always print
                                 visited_urls.add(link)
                                 queue.append(link)
+
+                                # Conditionally capture parent-child relationship
+                                if SETTINGS['enable_visual_tree_generation']:
+                                    link_relationships.append((url_to_crawl, link))
+
                                 # Submit new link for archiving if archiver_executor is provided
                                 if archiver_executor:
                                     archiving_futures.append(archiver_executor.submit(process_link_for_archiving, link, global_archive_action))
@@ -482,7 +504,7 @@ def crawl_website(base_url, archiver_executor, archiving_futures, global_archive
                         # Continue with other URLs, but log the error.
     except Exception as e:
         log_message('ERROR', f"An unexpected error occurred during website crawling: {e}")
-        return set() # Explicitly return an empty set on error
+        return set(), [] # Explicitly return an empty set and empty list on error
     finally:
         # Note: WebDriver instances are no longer explicitly quit after each URL.
         # They will persist for the lifetime of their respective worker threads within the ThreadPoolExecutor.p
@@ -490,7 +512,7 @@ def crawl_website(base_url, archiver_executor, archiving_futures, global_archive
         # which might require more advanced patterns for explicit resource management with concurrent.futures.
         pass
 
-    return all_unique_internal_links
+    return all_unique_internal_links, link_relationships # Return both discovered links and relationships
 
 def main():
     """
@@ -511,6 +533,7 @@ def main():
         return
 
     all_discovered_links = set() # Set to store all unique internal links found across all initial URLs
+    all_link_relationships = [] # List to store all (source, target) link relationships
     archiving_futures = [] # List to hold futures for archiving tasks
     crawling_futures = [] # New list to hold futures for crawling tasks
 
@@ -541,15 +564,16 @@ def main():
                 continue
             log_message('INFO', f"Starting crawl for initial URL: {url}")
             # Submit crawling tasks to the crawler_executor
+            # Pass the all_link_relationships list to the crawl_website function
             crawling_futures.append(
-                crawler_executor.submit(crawl_website, url, archiver_executor, archiving_futures, global_choice)
+                crawler_executor.submit(crawl_website, url, archiver_executor, archiving_futures, global_choice, all_link_relationships)
             )
 
         # Process crawling results as they complete
         log_message('INFO', "Waiting for crawling tasks to complete...")
         for future in concurrent.futures.as_completed(crawling_futures):
             try:
-                discovered_links_for_url = future.result()
+                discovered_links_for_url, _ = future.result() # Unpack both returned values, but only use the first
                 all_discovered_links.update(discovered_links_for_url)
             except Exception as e:
                 log_message('ERROR', f"Error during crawling task: {e}")
@@ -583,6 +607,64 @@ def main():
     log_message('INFO', "--- Archiving Summary ---")
     for result in results:
         print(result)
+
+    # If visual tree generation is enabled, proceed with graph generation
+    if SETTINGS['enable_visual_tree_generation']:
+        log_message('INFO', "--- Generating Visual Link Tree ---")
+        G = nx.DiGraph() # Create a directed graph
+
+        # Add nodes and edges from the collected relationships
+        for source, target in all_link_relationships:
+            G.add_edge(source, target)
+
+        # If no nodes were added (e.g., no links found or only one URL crawled), log and exit
+        if not G.nodes():
+            log_message('WARNING', "No graph nodes to display. Skipping visual tree generation.")
+            return
+
+        # Set the 'mother' URL (first initial URL) to be at the center
+        mother_url = initial_urls[0] # Assuming the first URL is the 'mother' URL
+        fixed_pos = {mother_url: (0, 0)} # Fix the mother URL at the center
+
+        # Increase figure size for better readability
+        plt.figure(figsize=(16, 12)) # New line for larger figure size
+
+        # Use a layout that works well for trees/hierarchical structures
+        # Pass the fixed_pos to spring_layout
+        pos = nx.spring_layout(G, k=0.15, iterations=50, seed=42, pos=fixed_pos, fixed=[mother_url]) # Increased iterations for better convergence
+
+        # Draw nodes with a smaller size and light color
+        # Differentiate the mother_url node
+        node_colors = ['lightblue' if node != mother_url else 'red' for node in G.nodes()]
+        node_sizes = [100 if node != mother_url else 300 for node in G.nodes()]
+        nx.draw_networkx_nodes(G, pos, node_size=node_sizes, node_color=node_colors, alpha=0.8)
+
+        # Draw edges with arrows, light gray color, and lower alpha
+        nx.draw_networkx_edges(G, pos, edgelist=G.edges(), edge_color='gray', arrows=True, arrowsize=10, alpha=0.6)
+
+        # Draw labels for nodes, but only for a subset or if the graph is small, to prevent clutter
+        # For very large graphs, this might need to be optimized (e.g., only label root/important nodes)
+        node_labels = {}
+        for node in G.nodes():
+            parsed_node = urlparse(node)
+            if parsed_node.path == '/' or not parsed_node.path:
+                node_labels[node] = parsed_node.netloc  # Use domain for root URLs
+            else:
+                node_labels[node] = parsed_node.path # Use path for other URLs
+
+        # Adjust font size based on the number of nodes to avoid overlap
+        # Adjusted font_size calculation for better scaling and smaller text
+        font_size = max(2, min(6, 400 // (len(G.nodes()) + len(initial_urls)))) if len(G.nodes()) > 0 else 8 # Modified this line
+
+        nx.draw_networkx_labels(G, pos, labels=node_labels, font_size=font_size, font_color='black', bbox=dict(facecolor='white', edgecolor='none', boxstyle='round,pad=0.2'))
+
+        plt.title('Website Internal Link Tree', size=20)
+        plt.axis('off') # Hide axes
+        plt.savefig('website_link_tree.png') # Save the plot
+        plt.show()
+        plt.close() # Close the plot to free up resources
+        log_message('INFO', "Visual link tree saved as 'website_link_tree.png'")
+
 
 if __name__ == "__main__":
     main()
