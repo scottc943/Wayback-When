@@ -1,5 +1,5 @@
 # Install required Python packages
-!pip install requests beautifulsoup4 waybackpy selenium webdriver-manager
+!pip install requests beautifulsoup4 waybackpy selenium webdriver-manager selenium-stealth
 
 # Install google-chrome-stable for better compatibility with ChromeDriver
 !wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add -
@@ -30,7 +30,15 @@ from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.common.by import By # Import By for CAPTCHA detection
 from selenium.common.exceptions import TimeoutException, WebDriverException # Import TimeoutException and WebDriverException
 
+# Import selenium-stealth
+from selenium_stealth import stealth
+
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+
+# Custom exception for CAPTCHA detection
+class CaptchaDetectedError(Exception):
+    """Custom exception to indicate that a CAPTCHA was detected."""
+    pass
 
 # Define Settings Dictionary
 SETTINGS = {
@@ -38,20 +46,35 @@ SETTINGS = {
     'urls_per_minute_limit': 15, # Max URLs to archive per minute
     'max_crawler_workers': 0, # Max concurrent workers for website crawling (0 for unlimited) - affects RAM usage massively
     'retries': 5, # Max retries for archivingsca single link
-    'default_archiving_action': 'n' # Default archiving action: 'n' (Normal), 'a' (Archive All), 's' (Skip All)
+    'default_archiving_action': 'n', # Default archiving action: 'n' (Normal), 'a' (Archive All), 's' (Skip All)
+    'debug_mode': False # Set to True to enable debug messages, False to disable
 }
 
 # Define a threading.local() object at the module level for WebDriver instances
 _thread_local = threading.local()
 
+# Lock to ensure only one CAPTCHA prompt is active at a time
+captcha_prompt_lock = threading.Lock()
+
 # Define User-Agent components for dynamic generation
 OS_TYPES = [
     "Windows NT 10.0; Win64; x64",
+    "Windows NT 6.3; Win64; x64",
+    "Windows NT 6.2; Win64; x64",
+    "Windows NT 6.1; Win64; x64",
     "Macintosh; Intel Mac OS X 10_15_7",
+    "Macintosh; Intel Mac OS X 10_14_6",
+    "Macintosh; Intel Mac OS X 10_13_6",
     "X11; Linux x86_64",
+    "X11; Ubuntu; Linux x86_64",
+    "X11; CrOS x86_64 15329.74.0",
     "Linux; Android 13; SM-G998B",
+    "Linux; Android 12; Pixel 6",
+    "Linux; Android 10; SM-A505FN",
     "iPhone; CPU iPhone OS 17_0 like Mac OS X",
-    "iPad; CPU OS 17_0 like Mac OS X"
+    "iPhone; CPU iPhone OS 16_0 like Mac OS X",
+    "iPad; CPU OS 17_0 like Mac OS X",
+    "iPad; CPU OS 16_0 like Mac OS X",
 ]
 
 BROWSER_TYPES = [
@@ -61,9 +84,9 @@ BROWSER_TYPES = [
     "AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/{version}.0.0.0 Mobile/15E148 Safari/604.1"
 ]
 
-CHROME_VERSIONS = [str(v) for v in range(100, 126)]
-FIREFOX_VERSIONS = [str(v) for v in range(100, 126)]
-SAFARI_VERSIONS = [str(v) for v in range(14, 17)]
+CHROME_VERSIONS = [str(v) for v in range(1, 126)]
+FIREFOX_VERSIONS = [str(v) for v in range(1, 126)]
+SAFARI_VERSIONS = [str(v) for v in range(1, 18)]
 
 def generate_random_user_agent():
     os = random.choice(OS_TYPES)
@@ -81,6 +104,17 @@ def generate_random_user_agent():
     browser = browser_template.format(version=version)
     return f"Mozilla/5.0 ({os}) {browser}"
 
+# Possible platforms, webgl_vendors, and renderers for randomization
+STEALTH_PLATFORMS = ["Win32", "Linux x86_64", "MacIntel"]
+STEALTH_WEBGL_VENDORS = [
+    "Google Inc. (Intel)", "Intel Inc.", "NVIDIA Corporation", "Apple Inc."
+]
+STEALTH_RENDERERS = [
+    "ANGLE (Intel, Intel(R) Iris(TM) Graphics 6100 (OpenGL 4.5), OpenGL 4.5.0)",
+    "Intel Iris OpenGL Engine",
+    "Google SwiftShader",
+    "Metal" # For MacIntel
+]
 
 # Function to set up and return a headless Chrome WebDriver
 def get_driver():
@@ -91,13 +125,25 @@ def get_driver():
     options.add_argument("--disable-gpu") # Added for headless stability
     # Explicitly set the binary location for google-chrome-stable
     options.binary_location = '/usr/bin/google-chrome'
-    # REMOVED: Select a random user-agent from the list and add to options. It will be set per request in get_internal_links.
-    # random_user_agent = random.choice(USER_AGENTS)
-    # options.add_argument(f"user-agent={random_user_agent}")
 
     # Initialize ChromeDriver using webdriver_manager to handle downloads and setup
     service = ChromeService(executable_path=ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
+
+    # Apply selenium-stealth with randomized parameters
+    stealth(driver,
+            languages=["en-US", "en"],
+            vendor="Google Inc.",
+            platform=random.choice(STEALTH_PLATFORMS),
+            webgl_vendor=random.choice(STEALTH_WEBGL_VENDORS),
+            renderer=random.choice(STEALTH_RENDERERS),
+            fix_hairline=True,
+            # Additional stealth options that might be available in newer versions:
+            # chrome_app=1,
+            # user_agent=generate_random_user_agent(), # If you want stealth to set the UA, otherwise it's set per request
+            # client_rects=True,
+            ) 
+
     driver.set_page_load_timeout(240) # Set page load timeout to 240 seconds (4 minutes)
     driver.command_executor.set_timeout(300) # Set command executor timeout to 300 seconds (5 minutes)
     return driver
@@ -133,7 +179,7 @@ def normalize_url(url):
     # Remove fragments
     path = parsed_url.path
 
-    # Remove trailing slashes from path, but keep for root '/' 
+    # Remove trailing slashes from path, but keep for root '/'
     if path.endswith('/') and path != '/':
         path = path.rstrip('/')
 
@@ -164,7 +210,8 @@ def get_internal_links(base_url, driver): # Modified to accept a driver object
     parsed_base_url = urlparse(base_url)
     domain = parsed_base_url.netloc
 
-    print(f"[DEBUG] Starting get_internal_links for base_url: {base_url} with domain: {domain}")
+    if SETTINGS['debug_mode']:
+        print(f"[DEBUG] Starting get_internal_links for base_url: {base_url} with domain: {domain}")
 
     retries = SETTINGS['retries'] # Use the 'retries' setting
     attempt = 0
@@ -195,27 +242,23 @@ def get_internal_links(base_url, driver): # Modified to accept a driver object
                     break
 
             if captcha_detected:
-                while True:
-                    print(f"[CAPTCHA DETECTED] for {base_url}.\nPlease solve the CAPTCHA manually in the browser if it becomes visible.\nType 'continue' to resume crawling or 'skip' to skip this URL:")
-                    user_choice = input().strip().lower()
-                    if user_choice == 'continue':
-                        print("Attempting to continue after manual intervention...")
-                        break # Break the loop to re-attempt processing the page
-                    elif user_choice == 'skip':
-                        print(f"Skipping {base_url} due to CAPTCHA.")
-                        return links # Return empty set if CAPTCHA detected and skipped
-                    else:
-                        print("Invalid input. Please type 'continue' or 'skip'.")
+                with captcha_prompt_lock:
+                    print(f"[CAPTCHA DETECTED] for {base_url}. Waiting 5-10 seconds before attempting to continue...")
+                    time.sleep(random.uniform(5, 10)) # Wait for a random time between 5 and 10 seconds
+                    print("Attempting to continue after automated wait...")
+                    # After waiting, the code will proceed to re-attempt scraping implicitly
 
             # --- MODIFICATION: Use Selenium to find links directly instead of BeautifulSoup ---
             # Find all anchor tags (<a>) that have an 'href' attribute using Selenium
-            print(f"[DEBUG] Page loaded for {base_url}. Extracting links...")
+            if SETTINGS['debug_mode']:
+                print(f"[DEBUG] Page loaded for {base_url}. Extracting links...")
             found_any_href = False
             for anchor_element in driver.find_elements(By.TAG_NAME, 'a'):
                 href = anchor_element.get_attribute('href')
                 if href:
                     found_any_href = True
-                    print(f"[DEBUG] Found href: {href}")
+                    if SETTINGS['debug_mode']:
+                        print(f"[DEBUG] Found href: {href}")
                     # Resolve relative URLs to absolute URLs
                     full_url = urljoin(base_url, href)
                     parsed_full_url = urlparse(full_url)
@@ -223,29 +266,32 @@ def get_internal_links(base_url, driver): # Modified to accept a driver object
                     # Check if the parsed URL's domain matches the base URL's domain
                     if parsed_full_url.netloc == domain:
                         clean_url = normalize_url(full_url)
-                        print(f"[DEBUG] Adding internal link: {clean_url}")
+                        if SETTINGS['debug_mode']:
+                            print(f"[DEBUG] Adding internal link: {clean_url}")
                         links.add(clean_url)
                     else:
-                        print(f"[DEBUG] Skipping external link: {full_url} (Domain: {parsed_full_url.netloc} != {domain})")
-            if not found_any_href:
+                        if SETTINGS['debug_mode']:
+                            print(f"[DEBUG] Skipping external link: {full_url} (Domain: {parsed_full_url.netloc} != {domain})")
+            if not found_any_href and SETTINGS['debug_mode']:
                 print(f"[DEBUG] No href attributes found on {base_url} by Selenium.")
 
-            print(f"[DEBUG] Finished processing {base_url}. Discovered {len(links)} links.")
+            if SETTINGS['debug_mode']:
+                print(f"[DEBUG] Finished processing {base_url}. Discovered {len(links)} links.")
             return links # If successful, break retry loop and return links
 
         # Handle specific HTTP errors during the request (Selenium errors are different from requests)
         except TimeoutException:
             print(f"[!] Page load timed out for {base_url}. Retrying ({retries - attempt - 1} attempts left).")
             attempt += 1
-            time.sleep(2) # Short delay before retrying
+            time.sleep(random.uniform(5, 15)) # Longer, randomized delay
         except WebDriverException as e:
             print(f"[!] A WebDriver error occurred while crawling {base_url}: {e}. Retrying ({retries - attempt - 1} attempts left).")
             attempt += 1
-            time.sleep(2) # Short delay before retrying
+            time.sleep(random.uniform(5, 15)) # Longer, randomized delay
         except Exception as e:
             print(f"[!] An unexpected error occurred while crawling {base_url} with Selenium: {e}. Retrying ({retries - attempt - 1} attempts left).")
             attempt += 1
-            time.sleep(2) # Short delay before retrying
+            time.sleep(random.uniform(5, 15)) # Longer, randomized delay
     print(f"[!] Failed to retrieve {base_url} after {retries} attempts.")
     return links
 
@@ -315,7 +361,7 @@ MIN_ARCHIVE_DELAY_SECONDS = 60 / SETTINGS['urls_per_minute_limit']
 def process_link_for_archiving(link, global_archive_action):
     """Checks if a link needs archiving and attempts to save it to Wayback Machine with rate limiting and retries.
 
-    Contributors: Optimizing rate limiting or adding more detailed logging for archive results would be valuable. 
+    Contributors: Optimizing rate limiting or adding more detailed logging for archive results would be valuable.
     """
     global last_archive_time
 
@@ -409,21 +455,33 @@ def crawl_website(base_url):
 
                 print(f"Processing batch of {len(current_batch_urls)} URLs for crawling.")
 
-                # Submit `wrapper_get_internal_links` for each URL in the batch to the executor.
-                for new_links_from_url in executor.map(wrapper_get_internal_links, current_batch_urls):
-                    # Ensure new_links_from_url is an iterable (e.g., set), even if an error occurred in wrapper_get_internal_links
-                    if new_links_from_url is None: # This should not happen if wrapper_get_internal_links somehow returns None
-                        continue # Skip if wrapper_get_internal_links somehow returns None
+                futures = {executor.submit(wrapper_get_internal_links, url_to_crawl): url_to_crawl for url_to_crawl in current_batch_urls}
 
-                    for link in new_links_from_url:
-                        all_unique_internal_links.add(link) # Add discovered link to the overall set
-                        # Print discovered URL if it's new
-                        if link not in visited_urls:
-                            print(f"[DISCOVERED] {link}")
-                            visited_urls.add(link)
-                            queue.append(link)
+                for future in concurrent.futures.as_completed(futures):
+                    url_to_crawl = futures[future]
+                    try:
+                        new_links_from_url = future.result()
+                        # Ensure new_links_from_url is an iterable (e.g., set), even if an error occurred in wrapper_get_internal_links
+                        if new_links_from_url is None: # This should not happen if wrapper_get_internal_links somehow returns None
+                            continue # Skip if wrapper_get_internal_links somehow returns None
+
+                        for link in new_links_from_url:
+                            all_unique_internal_links.add(link) # Add discovered link to the overall set
+                            # Print discovered URL if it's new
+                            if link not in visited_urls:
+                                print(f"[DISCOVERED] {link}") # This line will now always print
+                                visited_urls.add(link)
+                                queue.append(link)
+                    except CaptchaDetectedError as e:
+                        # This exception will only be caught if the user explicitly chose 'skip' in the CAPTCHA prompt
+                        # or if an unexpected CAPTCHA-related error occurred that wasn't handled by the prompt loop.
+                        print(f"CAPTCHA detection handled for {url_to_crawl}. Continuing with other URLs.")
+                        # No need to shutdown executor here, as the user opted to skip or continue.
+                    except Exception as e:
+                        print(f"An error occurred while processing {url_to_crawl}: {e}")
+                        # Continue with other URLs, but log the error.
     except Exception as e:
-        print(f"An error occurred during website crawling: {e}")
+        print(f"An unexpected error occurred during website crawling: {e}")
         return set() # Explicitly return an empty set on error
     finally:
         # Note: WebDriver instances are no longer explicitly quit after each URL.
@@ -440,7 +498,7 @@ def main():
 
     Contributors: Consider adding command-line argument parsing for URLs, or integrating a configuration file.
     """
-    # clear_output(wait=True) # Clear output at the very beginning for a cleaner console
+    clear_output(wait=True) # Clear output at the very beginning for a cleaner console
 
     # Prompt the user to enter one or more URLs
     target_urls_input = input("Enter URLs (comma-separated, e.g., https://notawebsite.org/, https://example.com/): ").strip()
@@ -467,7 +525,7 @@ def main():
     print(f"Found {len(all_discovered_links)} unique internal links across all initial URLs.")
 
     # Clear previous output before asking for archiving action to keep the console clean
-    # clear_output(wait=True)
+    clear_output(wait=True)
 
     # Set global archiving action based on SETTINGS, with validation and fallback
     global_choice = SETTINGS.get('default_archiving_action', 'n').lower() # Default to 'n' if not set or invalid
@@ -485,7 +543,7 @@ def main():
         print(f"Archiving action from settings: Normal. Archiving normally (respecting {SETTINGS['archiving_cooldown']*24}h rule) for {len(all_discovered_links)} discovered links.")
 
     # Clear output again before the final summary for cleanliness
-    # clear_output(wait=True)
+    clear_output(wait=True)
 
     results = [] # List to store the results of archiving attempts
     # Iterate through all discovered unique links (sorted for consistent output)
@@ -494,7 +552,7 @@ def main():
         results.append(process_link_for_archiving(link, global_choice))
 
     # Clear output again before the final summary for cleanliness
-    # clear_output(wait=True)
+    clear_output(wait=True)
 
     print("\n--- Archiving Summary ---")
     for result in results:
