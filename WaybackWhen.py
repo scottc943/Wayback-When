@@ -32,6 +32,11 @@ from selenium.common.exceptions import TimeoutException, WebDriverException # Im
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
+# Custom exception for CAPTCHA detection
+class CaptchaDetectedError(Exception):
+    """Custom exception to indicate that a CAPTCHA was detected."""
+    pass
+
 # Define Settings Dictionary
 SETTINGS = {
     'archiving_cooldown': 7, # Default cooldown in days
@@ -43,6 +48,9 @@ SETTINGS = {
 
 # Define a threading.local() object at the module level for WebDriver instances
 _thread_local = threading.local()
+
+# Lock to ensure only one CAPTCHA prompt is active at a time
+captcha_prompt_lock = threading.Lock()
 
 # Define User-Agent components for dynamic generation
 OS_TYPES = [
@@ -133,7 +141,7 @@ def normalize_url(url):
     # Remove fragments
     path = parsed_url.path
 
-    # Remove trailing slashes from path, but keep for root '/' 
+    # Remove trailing slashes from path, but keep for root '/'
     if path.endswith('/') and path != '/':
         path = path.rstrip('/')
 
@@ -195,17 +203,18 @@ def get_internal_links(base_url, driver): # Modified to accept a driver object
                     break
 
             if captcha_detected:
-                while True:
-                    print(f"[CAPTCHA DETECTED] for {base_url}.\nPlease solve the CAPTCHA manually in the browser if it becomes visible.\nType 'continue' to resume crawling or 'skip' to skip this URL:")
-                    user_choice = input().strip().lower()
-                    if user_choice == 'continue':
-                        print("Attempting to continue after manual intervention...")
-                        break # Break the loop to re-attempt processing the page
-                    elif user_choice == 'skip':
-                        print(f"Skipping {base_url} due to CAPTCHA.")
-                        return links # Return empty set if CAPTCHA detected and skipped
-                    else:
-                        print("Invalid input. Please type 'continue' or 'skip'.")
+                with captcha_prompt_lock:
+                    while True:
+                        print(f"[CAPTCHA DETECTED] for {base_url}.\nPlease solve the CAPTCHA manually in the browser if it becomes visible.\nType 'continue' to resume crawling or 'skip' to skip this URL:")
+                        user_choice = input().strip().lower()
+                        if user_choice == 'continue':
+                            print("Attempting to continue after manual intervention...")
+                            break # Break the loop to re-attempt processing the page
+                        elif user_choice == 'skip':
+                            print(f"Skipping {base_url} due to CAPTCHA.")
+                            return links # Return empty set if CAPTCHA detected and skipped
+                        else:
+                            print("Invalid input. Please type 'continue' or 'skip'.")
 
             # --- MODIFICATION: Use Selenium to find links directly instead of BeautifulSoup ---
             # Find all anchor tags (<a>) that have an 'href' attribute using Selenium
@@ -315,7 +324,7 @@ MIN_ARCHIVE_DELAY_SECONDS = 60 / SETTINGS['urls_per_minute_limit']
 def process_link_for_archiving(link, global_archive_action):
     """Checks if a link needs archiving and attempts to save it to Wayback Machine with rate limiting and retries.
 
-    Contributors: Optimizing rate limiting or adding more detailed logging for archive results would be valuable. 
+    Contributors: Optimizing rate limiting or adding more detailed logging for archive results would be valuable.
     """
     global last_archive_time
 
@@ -409,21 +418,33 @@ def crawl_website(base_url):
 
                 print(f"Processing batch of {len(current_batch_urls)} URLs for crawling.")
 
-                # Submit `wrapper_get_internal_links` for each URL in the batch to the executor.
-                for new_links_from_url in executor.map(wrapper_get_internal_links, current_batch_urls):
-                    # Ensure new_links_from_url is an iterable (e.g., set), even if an error occurred in wrapper_get_internal_links
-                    if new_links_from_url is None: # This should not happen if wrapper_get_internal_links somehow returns None
-                        continue # Skip if wrapper_get_internal_links somehow returns None
+                futures = {executor.submit(wrapper_get_internal_links, url_to_crawl): url_to_crawl for url_to_crawl in current_batch_urls}
 
-                    for link in new_links_from_url:
-                        all_unique_internal_links.add(link) # Add discovered link to the overall set
-                        # Print discovered URL if it's new
-                        if link not in visited_urls:
-                            print(f"[DISCOVERED] {link}")
-                            visited_urls.add(link)
-                            queue.append(link)
+                for future in concurrent.futures.as_completed(futures):
+                    url_to_crawl = futures[future]
+                    try:
+                        new_links_from_url = future.result()
+                        # Ensure new_links_from_url is an iterable (e.g., set), even if an error occurred in wrapper_get_internal_links
+                        if new_links_from_url is None: # This should not happen if wrapper_get_internal_links somehow returns None
+                            continue # Skip if wrapper_get_internal_links somehow returns None
+
+                        for link in new_links_from_url:
+                            all_unique_internal_links.add(link) # Add discovered link to the overall set
+                            # Print discovered URL if it's new
+                            if link not in visited_urls:
+                                print(f"[DISCOVERED] {link}")
+                                visited_urls.add(link)
+                                queue.append(link)
+                    except CaptchaDetectedError as e:
+                        # This exception will only be caught if the user explicitly chose 'skip' in the CAPTCHA prompt
+                        # or if an unexpected CAPTCHA-related error occurred that wasn't handled by the prompt loop.
+                        print(f"CAPTCHA detection handled for {url_to_crawl}. Continuing with other URLs.")
+                        # No need to shutdown executor here, as the user opted to skip or continue.
+                    except Exception as e:
+                        print(f"An error occurred while processing {url_to_crawl}: {e}")
+                        # Continue with other URLs, but log the error.
     except Exception as e:
-        print(f"An error occurred during website crawling: {e}")
+        print(f"An unexpected error occurred during website crawling: {e}")
         return set() # Explicitly return an empty set on error
     finally:
         # Note: WebDriver instances are no longer explicitly quit after each URL.
